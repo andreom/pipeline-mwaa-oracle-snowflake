@@ -22,11 +22,11 @@ S3_PREFIX = 'oracle-extracts'
 default_args = {
     'owner': 'data-team',
     'depends_on_past': False,
-    'start_date': datetime(2024, 1, 1),
+    'start_date': datetime(2025, 5, 5),
     'email_on_failure': True,
     'email_on_retry': False,
-    'retries': 2,
-    'retry_delay': timedelta(minutes=5),
+    'retries': 6,
+    'retry_delay': timedelta(minutes=10),
     'max_active_runs': 1
 }
 
@@ -36,7 +36,7 @@ dag = DAG(
     description='Extract data from Oracle RDS to Snowflake',
     schedule_interval='0 2 * * *',  # Daily at 2 AM
     catchup=False,
-    tags=['oracle', 'snowflake', 'etl']
+    tags=['oracle', 'snowflake']
 )
 
 def extract_oracle_data(**context):
@@ -68,8 +68,8 @@ def extract_oracle_data(**context):
     
     return file_path
 
-def load_to_snowflake(**context):
-    """Carrega dados do S3 para Snowflake"""
+def load_csv_to_snowflake(**context):
+    """Carrega dados CSV do S3 para Snowflake"""
     from snowflake_loader import SnowflakeLoader
     
     schema = context['params']['schema']
@@ -80,15 +80,41 @@ def load_to_snowflake(**context):
         key=f'{schema}_{table}_file_path'
     )
     
+    if not file_path:
+        context['task_instance'].log.warning(f"No file path found for {schema}.{table}")
+        return "No data to load"
+    
     loader = SnowflakeLoader(connection_id='snowflake_conn')
     
-    # Load com COPY command
-    result = loader.copy_from_s3(
-        s3_path=file_path,
-        target_schema=schema.lower(),
-        target_table=table.lower(),
-        file_format='PARQUET'
-    )
+    # Se file_path é uma lista (chunks), carrega múltiplos arquivos
+    if isinstance(file_path, list):
+        # Para múltiplos chunks, usa padrão wildcard
+        base_path = file_path[0].rsplit('_chunk_', 1)[0]
+        pattern_path = f"{base_path}_chunk_*.csv.gz"
+        
+        result = loader.copy_multiple_csv_files(
+            s3_path_pattern=pattern_path,
+            target_schema=schema.lower(),
+            target_table=table.lower()
+        )
+    else:
+        # Arquivo único
+        result = loader.copy_csv_from_s3(
+            s3_path=file_path,
+            target_schema=schema.lower(),
+            target_table=table.lower()
+        )
+    
+    # Validação opcional
+    try:
+        validation_result = loader.validate_csv_data_quality(
+            schema_name=schema.lower(),
+            table_name=table.lower(),
+            expected_min_rows=1
+        )
+        context['task_instance'].log.info(f"Data quality validation: {validation_result}")
+    except Exception as e:
+        context['task_instance'].log.warning(f"Data quality validation failed: {e}")
     
     return result
 
@@ -119,7 +145,7 @@ for schema, tables in SCHEMAS_CONFIG.items():
             # Carga no Snowflake
             load_task = PythonOperator(
                 task_id=f'load_{schema.lower()}_{table.lower()}',
-                python_callable=load_to_snowflake,
+                python_callable=load_csv_to_snowflake,
                 params={'schema': schema, 'table': table},
                 pool='snowflake_pool'
             )

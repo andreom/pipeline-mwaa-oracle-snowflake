@@ -24,153 +24,220 @@ class SnowflakeLoader:
         CREATE STAGE IF NOT EXISTS {stage_name}
         URL = 's3://{s3_bucket}/{s3_prefix}/'
         FILE_FORMAT = (
-            TYPE = PARQUET
-            COMPRESSION = SNAPPY
+            TYPE = CSV
+            FIELD_DELIMITER = ';'
+            RECORD_DELIMITER = '\\n'
+            SKIP_HEADER = 1
+            FIELD_OPTIONALLY_ENCLOSED_BY = '"'
+            TRIM_SPACE = TRUE
+            ERROR_ON_COLUMN_COUNT_MISMATCH = FALSE
+            ESCAPE_UNENCLOSED_FIELD = NONE
+            COMPRESSION = GZIP
+            ENCODING = 'UTF-8'
         )
         """
         
         self.snowflake_hook.run(create_stage_sql)
-        self.logger.info(f"Stage {stage_name} created/verified")
+        self.logger.info(f"Stage {stage_name} created/verified for CSV with gzip compression")
     
-    def create_table_from_parquet(self, schema_name, table_name, s3_file_path):
-        """Cria tabela no Snowflake baseada na estrutura do arquivo Parquet"""
+    def create_file_format_csv(self, format_name='CSV_SEMICOLON_GZIP'):
+        """Cria file format específico para CSV com ponto e vírgula e gzip"""
         
-        # Usa INFER_SCHEMA para detectar estrutura do Parquet
-        infer_sql = f"""
-        SELECT *
-        FROM TABLE(
-            INFER_SCHEMA(
-                LOCATION => '{s3_file_path}',
-                FILE_FORMAT => 'parquet'
+        create_format_sql = f"""
+        CREATE OR REPLACE FILE FORMAT {format_name}
+        TYPE = CSV
+        FIELD_DELIMITER = ';'
+        RECORD_DELIMITER = '\\n'
+        SKIP_HEADER = 1
+        FIELD_OPTIONALLY_ENCLOSED_BY = '"'
+        TRIM_SPACE = TRUE
+        ERROR_ON_COLUMN_COUNT_MISMATCH = FALSE
+        ESCAPE_UNENCLOSED_FIELD = NONE
+        COMPRESSION = GZIP
+        ENCODING = 'UTF-8'
+        NULL_IF = ('', 'NULL', 'null')
+        """
+        
+        self.snowflake_hook.run(create_format_sql)
+        self.logger.info(f"File format {format_name} created/updated")
+        return format_name
+    
+    def infer_schema_from_csv(self, s3_file_path, file_format='CSV_SEMICOLON_GZIP'):
+        """Infere schema de arquivo CSV no S3"""
+        
+        try:
+            infer_sql = f"""
+            SELECT *
+            FROM TABLE(
+                INFER_SCHEMA(
+                    LOCATION => '{s3_file_path}',
+                    FILE_FORMAT => '{file_format}'
+                )
             )
-        )
-        """
+            """
+            
+            schema_info = self.snowflake_hook.get_records(infer_sql)
+            return schema_info
+            
+        except Exception as e:
+            self.logger.warning(f"Could not infer schema from CSV: {e}")
+            return None
+    
+    def create_table_from_csv_schema(self, schema_name, table_name, s3_file_path):
+        """Cria tabela baseada na estrutura inferida do CSV"""
         
-        schema_info = self.snowflake_hook.get_records(infer_sql)
+        # Cria file format se não existir
+        file_format = self.create_file_format_csv()
         
-        # Constrói DDL da tabela
-        columns = []
-        for row in schema_info:
-            col_name = row[0]
-            col_type = self._map_parquet_to_snowflake_type(row[1])
-            columns.append(f"{col_name} {col_type}")
+        # Tenta inferir schema
+        schema_info = self.infer_schema_from_csv(s3_file_path, file_format)
         
-        create_table_sql = f"""
-        CREATE TABLE IF NOT EXISTS {schema_name}.{table_name} (
-            {', '.join(columns)},
-            _EXTRACTION_TIMESTAMP TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
-            _SOURCE_FILE STRING
-        )
-        """
+        if schema_info:
+            # Constrói DDL da tabela baseado no schema inferido
+            columns = []
+            for row in schema_info:
+                col_name = row[0]
+                col_type = self._map_csv_to_snowflake_type(row[1])
+                columns.append(f'"{col_name}" {col_type}')
+            
+            create_table_sql = f"""
+            CREATE TABLE IF NOT EXISTS {schema_name}.{table_name} (
+                {', '.join(columns)},
+                "_EXTRACTION_TIMESTAMP" TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+                "_SOURCE_FILE" STRING
+            )
+            """
+            
+        else:
+            # Fallback: cria tabela genérica
+            self.logger.warning(f"Using generic table structure for {schema_name}.{table_name}")
+            create_table_sql = f"""
+            CREATE TABLE IF NOT EXISTS {schema_name}.{table_name} (
+                data VARIANT,
+                "_EXTRACTION_TIMESTAMP" TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+                "_SOURCE_FILE" STRING
+            )
+            """
         
         self.snowflake_hook.run(create_table_sql)
         self.logger.info(f"Table {schema_name}.{table_name} created/verified")
     
-    def copy_from_s3(self, s3_path, target_schema, target_table, file_format='PARQUET'):
-        """Carrega dados do S3 para Snowflake usando COPY INTO"""
+    def copy_csv_from_s3(self, s3_path, target_schema, target_table, file_format='CSV_SEMICOLON_GZIP'):
+        """Carrega dados CSV do S3 para Snowflake usando COPY INTO"""
         
         # Garante que schema existe
         self.create_schema_if_not_exists(target_schema)
         
-        # Cria tabela se não existir (baseada no primeiro arquivo)
+        # Cria file format se não existir
+        if file_format == 'CSV_SEMICOLON_GZIP':
+            file_format = self.create_file_format_csv()
+        
+        # Cria tabela se não existir
         try:
-            self.create_table_from_parquet(target_schema, target_table, s3_path)
+            self.create_table_from_csv_schema(target_schema, target_table, s3_path)
         except Exception as e:
             self.logger.warning(f"Could not auto-create table: {e}")
         
-        # Comando COPY INTO
+        # Comando COPY INTO para CSV
         copy_sql = f"""
-        COPY INTO {target_schema}.{target_table}
-        FROM '{s3_path}'
-        FILE_FORMAT = (TYPE = {file_format})
-        MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
-        ON_ERROR = 'CONTINUE'
-        """
-        
-        # Adiciona metadados de auditoria
-        copy_sql_with_metadata = f"""
         COPY INTO {target_schema}.{target_table}
         FROM (
             SELECT 
-                *,
-                CURRENT_TIMESTAMP() as _EXTRACTION_TIMESTAMP,
-                METADATA$FILENAME as _SOURCE_FILE
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
+                CURRENT_TIMESTAMP() as "_PULLEDDATETIME",
+                METADATA$FILENAME as "_SOURCE_FILE"
             FROM '{s3_path}'
         )
-        FILE_FORMAT = (TYPE = {file_format})
+        FILE_FORMAT = '{file_format}'
+        ON_ERROR = 'CONTINUE'
+        """
+        
+        # Versão simplificada do COPY (auto-detecção de colunas)
+        copy_sql_simple = f"""
+        COPY INTO {target_schema}.{target_table}
+        FROM '{s3_path}'
+        FILE_FORMAT = '{file_format}'
         MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
         ON_ERROR = 'CONTINUE'
         """
         
         try:
-            result = self.snowflake_hook.run(copy_sql_with_metadata, autocommit=True)
-            self.logger.info(f"Data loaded successfully to {target_schema}.{target_table}")
+            # Tenta primeiro o COPY com auto-detecção
+            result = self.snowflake_hook.run(copy_sql_simple, autocommit=True)
+            self.logger.info(f"CSV data loaded successfully to {target_schema}.{target_table}")
             return result
+            
         except Exception as e:
-            # Fallback para COPY simples se metadados falharem
-            self.logger.warning(f"Metadata COPY failed, trying simple COPY: {e}")
-            result = self.snowflake_hook.run(copy_sql, autocommit=True)
-            return result
+            self.logger.warning(f"Auto-detection COPY failed, trying manual mapping: {e}")
+            
+            try:
+                # Fallback para COPY manual
+                result = self.snowflake_hook.run(copy_sql, autocommit=True)
+                return result
+            except Exception as e2:
+                self.logger.error(f"Both COPY methods failed: {e2}")
+                raise
     
-    def merge_incremental_data(self, target_schema, target_table, source_table, merge_keys):
-        """Executa MERGE para dados incrementais"""
+    def copy_multiple_csv_files(self, s3_path_pattern, target_schema, target_table):
+        """Carrega múltiplos arquivos CSV (útil para chunks)"""
         
-        merge_sql = f"""
-        MERGE INTO {target_schema}.{target_table} AS target
-        USING {source_table} AS source
-        ON {' AND '.join([f'target.{key} = source.{key}' for key in merge_keys])}
-        WHEN MATCHED THEN
-            UPDATE SET {', '.join([f'{col} = source.{col}' for col in self._get_table_columns(target_schema, target_table) if col not in merge_keys])}
-        WHEN NOT MATCHED THEN
-            INSERT ({', '.join(self._get_table_columns(target_schema, target_table))})
-            VALUES ({', '.join([f'source.{col}' for col in self._get_table_columns(target_schema, target_table)])})
+        # Para padrões de arquivo (exemplo: s3://bucket/path/file_*.csv.gz)
+        copy_sql = f"""
+        COPY INTO {target_schema}.{target_table}
+        FROM '{s3_path_pattern}'
+        FILE_FORMAT = (
+            TYPE = CSV
+            FIELD_DELIMITER = ';'
+            RECORD_DELIMITER = '\\n'
+            SKIP_HEADER = 1
+            FIELD_OPTIONALLY_ENCLOSED_BY = '"'
+            TRIM_SPACE = TRUE
+            ERROR_ON_COLUMN_COUNT_MISMATCH = FALSE
+            COMPRESSION = GZIP
+            ENCODING = 'UTF-8'
+        )
+        MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
+        ON_ERROR = 'CONTINUE'
         """
         
-        result = self.snowflake_hook.run(merge_sql, autocommit=True)
-        self.logger.info(f"MERGE completed for {target_schema}.{target_table}")
+        result = self.snowflake_hook.run(copy_sql, autocommit=True)
+        self.logger.info(f"Multiple CSV files loaded to {target_schema}.{target_table}")
         return result
     
-    def _map_parquet_to_snowflake_type(self, parquet_type):
-        """Mapeia tipos Parquet para tipos Snowflake"""
+    def _map_csv_to_snowflake_type(self, csv_type):
+        """Mapeia tipos CSV inferidos para tipos Snowflake"""
         
         type_mapping = {
-            'BIGINT': 'NUMBER(19,0)',
-            'INT': 'NUMBER(10,0)', 
-            'DOUBLE': 'FLOAT',
+            'NUMBER': 'NUMBER',
+            'DECIMAL': 'NUMBER(38,10)',
+            'INTEGER': 'NUMBER(38,0)',
+            'BIGINT': 'NUMBER(38,0)',
             'FLOAT': 'FLOAT',
+            'DOUBLE': 'FLOAT',
             'BOOLEAN': 'BOOLEAN',
+            'TEXT': 'VARCHAR(16777216)',
             'STRING': 'VARCHAR(16777216)',
-            'BINARY': 'BINARY',
+            'VARCHAR': 'VARCHAR(16777216)',
             'DATE': 'DATE',
-            'TIMESTAMP': 'TIMESTAMP_NTZ'
+            'TIME': 'TIME',
+            'TIMESTAMP': 'TIMESTAMP_NTZ',
+            'DATETIME': 'TIMESTAMP_NTZ'
         }
         
-        return type_mapping.get(parquet_type.upper(), 'VARCHAR(16777216)')
+        return type_mapping.get(csv_type.upper(), 'VARCHAR(16777216)')
     
-    def _get_table_columns(self, schema_name, table_name):
-        """Recupera colunas de uma tabela"""
-        
-        columns_sql = f"""
-        SELECT column_name 
-        FROM information_schema.columns 
-        WHERE table_schema = '{schema_name.upper()}' 
-        AND table_name = '{table_name.upper()}'
-        ORDER BY ordinal_position
-        """
-        
-        result = self.snowflake_hook.get_records(columns_sql)
-        return [row[0] for row in result]
-    
-    def validate_data_quality(self, schema_name, table_name, expected_min_rows=0):
-        """Valida qualidade dos dados carregados"""
+    def validate_csv_data_quality(self, schema_name, table_name, expected_min_rows=0):
+        """Valida qualidade dos dados CSV carregados"""
         
         validation_sql = f"""
         SELECT 
             COUNT(*) as total_rows,
-            COUNT(DISTINCT _SOURCE_FILE) as source_files,
-            MAX(_EXTRACTION_TIMESTAMP) as last_update
+            COUNT(DISTINCT "_SOURCE_FILE") as source_files,
+            MAX("_EXTRACTION_TIMESTAMP") as last_update,
+            COUNT(*) - COUNT(CASE WHEN "_SOURCE_FILE" IS NULL THEN 1 END) as rows_with_source
         FROM {schema_name}.{table_name}
-        WHERE DATE(_EXTRACTION_TIMESTAMP) = CURRENT_DATE()
+        WHERE DATE("_EXTRACTION_TIMESTAMP") = CURRENT_DATE()
         """
         
         result = self.snowflake_hook.get_first(validation_sql)
@@ -178,5 +245,33 @@ class SnowflakeLoader:
         if result[0] < expected_min_rows:
             raise ValueError(f"Data quality check failed: only {result[0]} rows loaded, expected at least {expected_min_rows}")
         
-        self.logger.info(f"Data quality validation passed: {result[0]} rows loaded from {result[1]} files")
+        self.logger.info(f"CSV data quality validation passed: {result[0]} rows loaded from {result[1]} files")
         return result
+    
+    def get_copy_history(self, table_name, hours_back=24):
+        """Verifica histórico de COPY para debugging"""
+        
+        history_sql = f"""
+        SELECT 
+            FILE_NAME,
+            FILE_SIZE,
+            ROW_COUNT,
+            ROW_PARSED,
+            FIRST_ERROR_MESSAGE,
+            FIRST_ERROR_LINE_NUMBER,
+            FIRST_ERROR_CHARACTER_POSITION,
+            LAST_LOAD_TIME
+        FROM TABLE(INFORMATION_SCHEMA.COPY_HISTORY(
+            TABLE_NAME => '{table_name}',
+            START_TIME => DATEADD(hours, -{hours_back}, CURRENT_TIMESTAMP())
+        ))
+        ORDER BY LAST_LOAD_TIME DESC
+        """
+        
+        try:
+            result = self.snowflake_hook.get_records(history_sql)
+            self.logger.info(f"Retrieved COPY history for {table_name}: {len(result)} operations")
+            return result
+        except Exception as e:
+            self.logger.warning(f"Could not retrieve COPY history: {e}")
+            return []
